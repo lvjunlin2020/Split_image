@@ -1,0 +1,31 @@
+[package]
+name = "Split_image"
+version = "1.1.0"
+edition = "2021"
+description = "图像等分切分工具:选文件或文件夹,按纵向/横向份数切分,以原文件名为前缀保存"
+
+# 包名保留大写(exe 叫 Split_image.exe),lib 目标统一 snake_case 便于 use
+[lib]
+name = "split_image"
+
+[dependencies]
+# GUI:egui(纯 Rust,单 exe 无运行库;glow 渲染器比 wgpu 编译快一倍)
+eframe = { version = "=0.29.1", default-features = false, features = ["glow", "default_fonts"] }
+# 图像编解码:默认特性覆盖 png/jpeg/bmp/gif/tiff/webp/tga/ico 等,全纯 Rust
+image = "0.25"
+# 原生文件/文件夹选择对话框
+rfd = "0.17"
+# Windows API:CLI 模式附加父进程控制台
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

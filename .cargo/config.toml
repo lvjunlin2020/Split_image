@@ -1,0 +1,12 @@
+# 放到项目 .cargo/config.toml(脚本会自动替换 Split_image)
+[build]
+target-dir = "D:/rust-target/Split_image"
+
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 3
