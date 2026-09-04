@@ -62,7 +62,7 @@ fn batch_pipeline_reports_and_continues_on_error() {
 
     let cancel = AtomicBool::new(false);
     let mut lines = Vec::new();
-    let (ok, fail) = split_all(&files, 2, 3, |_, _, line| lines.push(line), &cancel);
+    let (ok, fail) = split_all(&files, 2, 3, None, |_, _, line| lines.push(line), &cancel);
     assert_eq!((ok, fail), (2, 1));
     assert!(lines.iter().any(|l| l.contains("broken.png")));
     // 好文件照常产出
@@ -100,7 +100,7 @@ fn cancel_stops_after_current_file() {
     }
     let files = scan_folder(&dir);
     let cancel = AtomicBool::new(true); // 立即取消:第一个文件完成后中断
-    let (ok, _fail) = split_all(&files, 2, 2, |_, _, _| {}, &cancel);
+    let (ok, _fail) = split_all(&files, 2, 2, None, |_, _, _| {}, &cancel);
     assert_eq!(ok, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

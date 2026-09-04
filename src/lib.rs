@@ -69,9 +69,8 @@ fn out_extension(orig: &Path) -> String {
     }
 }
 
-/// 第 (row, col) 块(1 起)的输出路径。stem 超 160 字符先截断(Windows 单组件限 255)。
-fn piece_path(orig: &Path, row: u32, col: u32) -> PathBuf {
-    let dir = orig.parent().unwrap_or(Path::new("."));
+/// 第 (row, col) 块(1 起)的输出路径,写到 `dir`。stem 超 160 字符先截断(Windows 单组件限 255)。
+fn piece_path(dir: &Path, orig: &Path, row: u32, col: u32) -> PathBuf {
     let full_stem = orig
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -98,14 +97,26 @@ pub fn open_with_orientation(path: &Path) -> image::ImageResult<DynamicImage> {
 
 /// GUI 提示用:第 (row, col) 块的输出文件名(仅文件名部分)。
 pub fn example_piece_name(orig: &Path, row: u32, col: u32) -> String {
-    piece_path(orig, row, col)
+    let dir = orig.parent().unwrap_or(Path::new("."));
+    piece_path(dir, orig, row, col)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// 切分单个文件,返回写出的份数。已有同名输出会直接覆盖(便于换参数重跑)。
+/// 切分单个文件(输出到原图同目录),返回写出的份数。已有同名输出会直接覆盖(便于换参数重跑)。
 pub fn split_file(orig: &Path, rows: u32, cols: u32) -> Result<usize, String> {
+    split_file_to(orig, None, rows, cols)
+}
+
+/// 切分单个文件;`out_dir = Some(d)` 时全部块输出到指定目录(目录须已存在),
+/// `None` 时输出到原图同目录。返回写出的份数;已有同名输出直接覆盖。
+pub fn split_file_to(
+    orig: &Path,
+    out_dir: Option<&Path>,
+    rows: u32,
+    cols: u32,
+) -> Result<usize, String> {
     let img = open_with_orientation(orig).map_err(|e| format!("读取失败: {e}"))?;
     let (w, h) = (img.width(), img.height());
     if w < cols || h < rows {
@@ -113,10 +124,11 @@ pub fn split_file(orig: &Path, rows: u32, cols: u32) -> Result<usize, String> {
             "尺寸 {w}×{h} 小于切分份数 {rows}×{cols},会出现空块"
         ));
     }
+    let dir = out_dir.unwrap_or_else(|| orig.parent().unwrap_or(Path::new(".")));
     let jpeg = ImageFormat::from_path(orig).map(|f| f == ImageFormat::Jpeg).unwrap_or(false);
     for (row, col, x, y, cw, ch) in grid_cells(w, h, rows, cols) {
         let piece = img.crop_imm(x, y, cw, ch);
-        let path = piece_path(orig, row, col);
+        let path = piece_path(dir, orig, row, col);
         let result = if jpeg {
             // DynamicImage 的编码方法会自动转成编码器支持的颜色类型(RGBA→RGB)
             let file =
@@ -146,11 +158,13 @@ pub fn scan_folder(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 批量切分。`on_file(done, total, line)` 用于进度回调;返回 (成功文件数, 失败文件数)。
+/// 批量切分;`out_dir` 语义同 [`split_file_to`]。`on_file(done, total, line)` 用于进度回调;
+/// 返回 (成功文件数, 失败文件数)。
 pub fn split_all(
     files: &[PathBuf],
     rows: u32,
     cols: u32,
+    out_dir: Option<&Path>,
     mut on_file: impl FnMut(usize, usize, String),
     cancel: &AtomicBool,
 ) -> (usize, usize) {
@@ -161,7 +175,7 @@ pub fn split_all(
             on_file(i, total, format!("已停止,剩余 {} 个文件跳过", total - i));
             break;
         }
-        let line = match split_file(path, rows, cols) {
+        let line = match split_file_to(path, out_dir, rows, cols) {
             Ok(n) => {
                 ok += 1;
                 format!("✔ {} → {n} 份", path.display())
@@ -243,11 +257,34 @@ mod tests {
 
     #[test]
     fn piece_path_uses_stem_prefix_and_keeps_ext() {
-        let p = piece_path(Path::new(r"C:\pics\照片 A.jpg"), 2, 3);
+        let orig = Path::new(r"C:\pics\照片 A.jpg");
+        let p = piece_path(Path::new(r"C:\pics"), orig, 2, 3);
         assert_eq!(p, PathBuf::from(r"C:\pics\照片 A_r02c03.jpg"));
+        // 输出目录与原图目录解耦
+        let p1 = piece_path(Path::new(r"D:\out"), orig, 1, 1);
+        assert_eq!(p1, PathBuf::from(r"D:\out\照片 A_r01c01.jpg"));
         // 不可编码格式回退 png
-        let p2 = piece_path(Path::new("/tmp/x.dds"), 1, 1);
+        let p2 = piece_path(Path::new("/tmp"), Path::new("/tmp/x.dds"), 1, 1);
         assert_eq!(p2, PathBuf::from("/tmp/x_r01c01.png"));
+    }
+
+    #[test]
+    fn custom_output_dir_receives_all_pieces() {
+        let dir = temp_dir("outdir");
+        let out = dir.join("pieces");
+        std::fs::create_dir_all(&out).unwrap();
+        let src = dir.join("img.png");
+        RgbImage::new(60, 40).save(&src).unwrap();
+
+        assert_eq!(split_file_to(&src, Some(&out), 2, 2).unwrap(), 4);
+        for r in 1..=2 {
+            for c in 1..=2 {
+                assert!(out.join(format!("img_r0{r}c0{c}.png")).exists());
+            }
+        }
+        // 原图目录不出现切分输出
+        assert!(!dir.join("img_r01c01.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

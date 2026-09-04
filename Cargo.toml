@@ -1,6 +1,6 @@
 [package]
 name = "Split_image"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "图像等分切分工具:选文件或文件夹,按纵向/横向份数切分,以原文件名为前缀保存"
 

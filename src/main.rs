@@ -8,6 +8,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -23,7 +24,7 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 185, 238);
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--cli") {
-        attach_parent_console();
+        attach_console_if_parent();
         let code = run_cli(&args);
         std::process::exit(code);
     }
@@ -33,17 +34,69 @@ fn main() {
     }
 }
 
-/// 把输出接到启动本程序的父进程控制台(从 cmd 运行 --cli 时能看到输出)
+/// stdout 输出,写入失败不 panic(句柄可能无效,见 attach_console_if_parent)。
+fn outln(s: &str) {
+    let mut o = std::io::stdout();
+    let _ = writeln!(o, "{s}");
+    let _ = o.flush();
+}
+
+/// stderr 输出,写入失败不 panic。
+fn errln(s: &str) {
+    let mut e = std::io::stderr();
+    let _ = writeln!(e, "{s}");
+    let _ = e.flush();
+}
+
+/// GUI 子系统 exe 在终端里跑 CLI 时,把输出接到父进程控制台(坑 #9)。
+/// 只有当进程没有继承到有效 std 句柄(交互式从 cmd 启动)才做附加;
+/// 句柄已被重定向到管道/文件时(脚本、Git Bash、测试)原生可用,绝不能覆盖。
 #[cfg(windows)]
-fn attach_parent_console() {
-    use windows_sys::Win32::System::Console::AttachConsole;
-    use windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS;
+fn attach_console_if_parent() {
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
     unsafe {
-        AttachConsole(ATTACH_PARENT_PROCESS);
+        let out_ok = GetStdHandle(STD_OUTPUT_HANDLE) > 0;
+        let err_ok = GetStdHandle(STD_ERROR_HANDLE) > 0;
+        if out_ok && err_ok {
+            return; // 已有有效输出通道(管道/文件/控制台),无需附加
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            if !out_ok {
+                reopen(STD_OUTPUT_HANDLE, 1);
+                reopen(STD_ERROR_HANDLE, 2);
+            }
+            if GetStdHandle(STD_INPUT_HANDLE) <= 0 {
+                reopen(STD_INPUT_HANDLE, 0);
+            }
+        }
+    }
+
+    fn reopen(std_handle: u32, fd: i32) {
+        use std::os::raw::c_int;
+        extern "C" {
+            fn _open_osfhandle(osfhandle: isize, flags: c_int) -> c_int;
+            fn _dup2(fildes: c_int, fildes2: c_int) -> c_int;
+            fn _close(fildes: c_int) -> c_int;
+        }
+        unsafe {
+            let h = GetStdHandle(std_handle) as isize;
+            if h <= 0 {
+                return;
+            }
+            let new_fd = _open_osfhandle(h, 0x8000); // _O_BINARY
+            if new_fd >= 0 {
+                if _dup2(new_fd, fd as c_int) != 0 {
+                    _close(new_fd);
+                }
+            }
+        }
     }
 }
 #[cfg(not(windows))]
-fn attach_parent_console() {}
+fn attach_console_if_parent() {}
 
 /// 在资源管理器中打开目录(浏览切分结果)
 #[cfg(windows)]
@@ -78,15 +131,31 @@ fn open_folder(path: &std::path::Path) -> Result<(), String> {
 // ============================== CLI 模式 ==============================
 
 fn run_cli(args: &[String]) -> i32 {
-    let positional: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--cli").collect();
+    // 解析:--cli 忽略;--out <目录> 可选;其余为位置参数
+    let mut positional: Vec<&String> = Vec::new();
+    let mut out_dir: Option<PathBuf> = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--cli" => {}
+            "--out" => match it.next() {
+                Some(d) => out_dir = Some(PathBuf::from(d)),
+                None => {
+                    errln("--out 需要跟一个目录路径");
+                    return 2;
+                }
+            },
+            _ => positional.push(a),
+        }
+    }
     if positional.len() < 3 {
-        eprintln!("用法: Split_image --cli <纵向刀数> <横向刀数> <图像文件或文件夹>...");
+        errln("用法: Split_image --cli <纵向刀数> <横向刀数> <图像文件或文件夹>... [--out <输出目录>]");
         return 2;
     }
     let (vcuts, hcuts): (u32, u32) = match (positional[0].parse(), positional[1].parse()) {
         (Ok(v), Ok(h)) if valid_cuts(v, h) => (v, h),
         _ => {
-            eprintln!("刀数须为 0~{} 的整数(0 = 该方向不切)", MAX_GRID - 1);
+            errln(&format!("刀数须为 0~{} 的整数(0 = 该方向不切)", MAX_GRID - 1));
             return 2;
         }
     };
@@ -99,24 +168,38 @@ fn run_cli(args: &[String]) -> i32 {
         } else if path.is_file() {
             files.push(path);
         } else {
-            eprintln!("路径不存在: {p}");
+            errln(&format!("路径不存在: {p}"));
             return 2;
         }
     }
     if files.is_empty() {
-        eprintln!("未找到图像文件");
+        errln("未找到图像文件");
         return 2;
     }
-    eprintln!("开始: {} 个文件,纵向 {vcuts} 刀 + 横向 {hcuts} 刀 → {rows} 行 × {cols} 列", files.len());
+    if let Some(d) = &out_dir {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            errln(&format!("无法创建输出目录 {}: {e}", d.display()));
+            return 2;
+        }
+    }
+    let dest = match &out_dir {
+        Some(d) => format!(" → {}", d.display()),
+        None => String::new(),
+    };
+    outln(&format!(
+        "开始: {} 个文件,纵向 {vcuts} 刀 + 横向 {hcuts} 刀 → {rows} 行 × {cols} 列{dest}",
+        files.len()
+    ));
     let cancel = AtomicBool::new(false);
     let (ok, fail) = split_all(
         &files,
         rows,
         cols,
-        |done, total, line| eprintln!("[{done}/{total}] {line}"),
+        out_dir.as_deref(),
+        |done, total, line| outln(&format!("[{done}/{total}] {line}")),
         &cancel,
     );
-    eprintln!("完成: 成功 {ok},失败 {fail}");
+    outln(&format!("完成: 成功 {ok},失败 {fail}"));
     if fail > 0 { 1 } else { 0 }
 }
 
@@ -147,6 +230,8 @@ struct App {
     ctx: egui::Context,
     selection: Selection,
     folder_files: Vec<PathBuf>,
+    /// 自定义输出目录(None = 输出到原图所在目录)
+    out_dir: Option<PathBuf>,
     /// 纵向刀数(竖直切线 → 分出 vcuts+1 列)
     vcuts: u32,
     /// 横向刀数(水平切线 → 分出 hcuts+1 行)
@@ -156,6 +241,8 @@ struct App {
     cancel: Arc<AtomicBool>,
     progress: Option<(usize, usize)>,
     thumb: Option<Thumb>,
+    /// 「关于」对话框开合
+    about_open: bool,
 }
 
 impl App {
@@ -169,6 +256,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             selection: Selection::None,
             folder_files: Vec::new(),
+            out_dir: None,
             vcuts: 1,
             hcuts: 1,
             log: Vec::new(),
@@ -176,6 +264,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             progress: None,
             thumb: None,
+            about_open: false,
         }
     }
 
@@ -186,9 +275,8 @@ impl App {
         }
     }
 
-    fn select_file(&mut self, path: PathBuf) {
-        self.selection = Selection::File(path.clone());
-        self.folder_files.clear();
+    /// 后台解码缩略图(单文件/文件夹首图共用);大图解码不卡 UI
+    fn spawn_thumb(&mut self, path: PathBuf) {
         self.thumb = None;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
@@ -198,15 +286,24 @@ impl App {
         });
     }
 
+    fn select_file(&mut self, path: PathBuf) {
+        self.selection = Selection::File(path.clone());
+        self.folder_files.clear();
+        self.spawn_thumb(path);
+    }
+
     fn select_folder(&mut self, path: PathBuf) {
         self.selection = Selection::Folder(path.clone());
-        self.thumb = None;
         self.folder_files = scan_folder(&path);
         self.log(format!(
             "文件夹 {} :找到 {} 个图像文件",
             path.display(),
             self.folder_files.len()
         ));
+        // 批量模式预览第一张图片
+        if let Some(first) = self.folder_files.first().cloned() {
+            self.spawn_thumb(first);
+        }
     }
 
     fn ready(&self) -> bool {
@@ -214,6 +311,18 @@ impl App {
             Selection::File(p) => p.is_file(),
             Selection::Folder(_) => !self.folder_files.is_empty(),
             Selection::None => false,
+        }
+    }
+
+    /// 实际输出目录:自定义目录优先,否则原图所在目录
+    fn effective_out_dir(&self) -> Option<PathBuf> {
+        if let Some(d) = &self.out_dir {
+            return Some(d.clone());
+        }
+        match &self.selection {
+            Selection::File(p) => p.parent().map(|d| d.to_path_buf()),
+            Selection::Folder(d) => Some(d.clone()),
+            Selection::None => None,
         }
     }
 
@@ -228,27 +337,46 @@ impl App {
             return;
         }
         let (rows, cols) = cuts_to_parts(self.vcuts, self.hcuts);
+        // 自定义输出目录:启动时确保存在,失败直接提示不进入忙碌态
+        if let Some(d) = &self.out_dir {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                self.log(format!("输出文件夹不可用({}): {e}", d.display()));
+                return;
+            }
+        }
+        let out_dir = self.out_dir.clone();
         self.busy = true;
         self.progress = Some((0, files.len()));
+        let dest = match &out_dir {
+            Some(d) => d.display().to_string(),
+            None => "原图同目录".to_string(),
+        };
         self.log(format!(
-            "开始切分:{} 个文件,纵向 {} 刀 + 横向 {} 刀 → {rows} 行 × {cols} 列(每文件 {} 份)",
+            "开始切分:{} 个文件,纵向 {} 刀 + 横向 {} 刀 → {rows} 行 × {cols} 列(每文件 {} 份)→ {dest}",
             files.len(),
             self.vcuts,
             self.hcuts,
             rows * cols
         ));
-        self.cancel.store(false, Ordering::Relaxed);
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let cancel = self.cancel.clone();
+        self.cancel.store(false, Ordering::Relaxed);
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
-            let (ok, fail) = split_all(&files, rows, cols, move |done, total, line| {
-                let _ = tx2.send(Msg::Log(line));
-                let _ = tx2.send(Msg::Progress { done, total });
-                ctx2.request_repaint();
-            }, &cancel);
+            let (ok, fail) = split_all(
+                &files,
+                rows,
+                cols,
+                out_dir.as_deref(),
+                move |done, total, line| {
+                    let _ = tx2.send(Msg::Log(line));
+                    let _ = tx2.send(Msg::Progress { done, total });
+                    ctx2.request_repaint();
+                },
+                &cancel,
+            );
             let _ = tx.send(Msg::Finished { ok, fail });
             ctx.request_repaint();
         });
@@ -349,11 +477,12 @@ impl eframe::App for App {
             );
             ui.add_space(8.0);
 
-            // -------- 1. 选择来源 --------
+            // -------- 1. 选择来源 + 输出位置 --------
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     let pick_file = ui.button("📄 选择图像文件…").clicked();
                     let pick_folder = ui.button("📁 选择文件夹(批量)…").clicked();
+                    let pick_out = ui.button("📂 输出文件夹…").clicked();
                     if pick_file && !self.busy {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter(
@@ -372,8 +501,35 @@ impl eframe::App for App {
                             self.select_folder(p);
                         }
                     }
+                    if pick_out && !self.busy {
+                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                            self.log(format!("输出文件夹已设置:{}", d.display()));
+                            self.out_dir = Some(d);
+                        }
+                    }
                 });
                 ui.add_space(4.0);
+                // 输出位置行:自定义目录可一键恢复默认(原图所在目录)
+                ui.horizontal(|ui| {
+                    match self.effective_out_dir() {
+                        Some(d) => {
+                            ui.label(format!("输出位置:{}", d.display()));
+                            if self.out_dir.is_some()
+                                && ui
+                                    .small_button("恢复默认")
+                                    .on_hover_text("输出回原图所在目录")
+                                    .clicked()
+                            {
+                                self.out_dir = None;
+                                self.log("输出位置已恢复默认:原图所在目录");
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("输出位置:未选择(默认原图所在目录)").weak());
+                        }
+                    }
+                });
+                ui.add_space(2.0);
                 match &self.selection {
                     Selection::None => {
                         ui.label(
@@ -389,7 +545,16 @@ impl eframe::App for App {
                     }
                     Selection::Folder(p) => {
                         ui.label(format!("文件夹:{}", p.display()));
-                        ui.label(format!("批量模式:将处理 {} 个图像文件", self.folder_files.len()));
+                        let mut info = format!("批量模式:将处理 {} 个图像文件", self.folder_files.len());
+                        if let (Some(t), Some(first)) = (&self.thumb, self.folder_files.first()) {
+                            info.push_str(&format!(
+                                "(预览首图 {}:{}×{} px)",
+                                first.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                                t.dims.0,
+                                t.dims.1
+                            ));
+                        }
+                        ui.label(info);
                     }
                 }
             });
@@ -416,13 +581,12 @@ impl eframe::App for App {
                 if let Selection::File(p) = &self.selection {
                     let (rows, cols) = cuts_to_parts(self.vcuts, self.hcuts);
                     let example = example_piece_name(p, rows.min(2), cols.min(2));
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "输出示例:{example}(保存在原图同目录)"
-                        ))
-                        .weak(),
-                    )
-                    .on_hover_text("命名规则:原文件名_r行c列.扩展名;重跑会覆盖同名输出");
+                    let dest = match &self.out_dir {
+                        Some(d) => format!("保存在 {}", d.display()),
+                        None => "保存在原图同目录".to_string(),
+                    };
+                    ui.label(egui::RichText::new(format!("输出示例:{example}({dest})")).weak())
+                        .on_hover_text("命名规则:原文件名_r行c列.扩展名;重跑会覆盖同名输出");
                 }
             });
 
@@ -469,7 +633,7 @@ impl eframe::App for App {
                     painter.text(
                         img_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "无预览(未选择或文件夹批量)",
+                        "无预览(未选择)",
                         egui::FontId::proportional(14.0),
                         egui::Color32::from_gray(120),
                     );
@@ -540,12 +704,8 @@ impl eframe::App for App {
                     }
                     ui.spinner();
                 }
-                // 浏览切分结果:打开输出所在目录(单文件=原图目录,批量=所选文件夹)
-                let out_dir: Option<PathBuf> = match &self.selection {
-                    Selection::File(p) => p.parent().map(|d| d.to_path_buf()),
-                    Selection::Folder(d) => Some(d.clone()),
-                    Selection::None => None,
-                };
+                // 浏览切分结果:打开实际输出目录(自定义目录优先,否则原图所在目录)
+                let out_dir = self.effective_out_dir();
                 let browse =
                     ui.add_enabled(out_dir.is_some(), egui::Button::new("📂 浏览切分结果"));
                 if browse.clicked() {
@@ -555,9 +715,12 @@ impl eframe::App for App {
                         }
                     }
                 }
-                browse.on_hover_text("在资源管理器中打开切分结果的保存目录(原图所在目录)");
+                browse.on_hover_text("在资源管理器中打开切分结果的保存目录");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
+                    if ui.button("关于").clicked() {
+                        self.about_open = true;
+                    }
                 });
             });
             if let Some((done, total)) = self.progress {
@@ -582,6 +745,48 @@ impl eframe::App for App {
                     }
                 });
         });
+
+        // 「关于」对话框:bool 开合 + Window + CENTER_CENTER 锚定 + Foreground 置顶
+        if self.about_open {
+            egui::Window::new("关于")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.set_width(430.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("图像等分切分工具")
+                                .strong()
+                                .size(17.0)
+                                .color(ACCENT),
+                        );
+                        ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
+                    });
+                    ui.add_space(8.0);
+                    ui.label("把图像按纵向/横向刀数等分切开,支持单文件与文件夹批量,输出以原文件名为前缀。");
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("切分语义").strong());
+                    ui.label("• 纵向切分数(竖刀):竖直方向切几刀,分出左右 N+1 列");
+                    ui.label("• 横向切分数(横刀):水平方向切几刀,分出上下 N+1 行");
+                    ui.label("• 示例:4 列 × 3 行的拼合图 = 纵向 3 刀 + 横向 2 刀");
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("输出规则").strong());
+                    ui.label("• 命名:原文件名_r行c列.扩展名;默认在原图同目录,可用「输出文件夹…」改到别处");
+                    ui.label("• 沿用原格式(JPEG 质量 95);EXIF 方向自动转正;余数归末块,切完可无缝拼回");
+                    ui.label("• 命令行:Split_image --cli <纵向刀数> <横向刀数> <文件或文件夹> [--out <目录>]");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("技术栈:Rust + egui");
+                        ui.hyperlink_to("GitHub 仓库", "https://github.com/lvjunlin2020/Split_image");
+                    });
+                    ui.add_space(8.0);
+                    if ui.button("关闭").clicked() {
+                        self.about_open = false;
+                    }
+                });
+        }
     }
 }
 
